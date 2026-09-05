@@ -37,7 +37,15 @@
 #include <sys/types.h>
 
 /* ---- libusb-1.0 --------------------------------------------------------- */
-#include <libusb-1.0/libusb.h>
+#if defined(__has_include)
+#  if __has_include(<libusb-1.0/libusb.h>)
+#    include <libusb-1.0/libusb.h>
+#  else
+#    include <libusb.h>
+#  endif
+#else
+#  include <libusb.h>
+#endif
 
 /* ---- DirtyJTAG USB identifiers ------------------------------------------ */
 #define DIRTYJTAG_VID      0x1209

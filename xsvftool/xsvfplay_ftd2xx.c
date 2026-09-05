@@ -28,11 +28,9 @@
 // #define ASYNC_WRITE
 // #define BACKGROUND_READ
 // #define INTERLACED_READ_WRITE
-
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <ftd2xx.h>
 #include <io.h>
 #include <math.h>
 #include <stdint.h>
@@ -43,6 +41,8 @@
 #include <sys/types.h>
 #include <time.h>
 #include <windows.h>
+
+#include <ftd2xx.h>
 
 #ifdef BACKGROUND_READ
 #error "BACKGROUND_READ not yet implemented for Windows. Please disable."
