@@ -1,131 +1,31 @@
 /*
  *  Lib(X)SVF  -  A library for implementing SVF and XSVF JTAG players
+ *  libftdi1 Port
  *
  *  Copyright (C) 2009  RIEGL Research ForschungsGmbH
  *  Copyright (C) 2009  Clifford Wolf <clifford@clifford.at>
- *
- *  Windows port modifications
- *
- *  Permission to use, copy, modify, and/or distribute this software for any
- *  purpose with or without fee is hereby granted, provided that the above
- *  copyright notice and this permission notice appear in all copies.
- *
- *  THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- *  WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- *  MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- *  ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- *  WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- *  ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
- *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
- *
  */
 
 #include "libxsvf.h"
 
 #define BUFFER_SIZE (1024 * 16)
-
 #define BLOCK_WRITE
-// #define ASYNC_WRITE
-// #define BACKGROUND_READ
-// #define INTERLACED_READ_WRITE
 
 #include <assert.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <ftd2xx.h>
-#include <io.h>
-#include <math.h>
-#include <stdint.h>
+#include <ftdi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+
+#include <math.h>
+#include <stdint.h>
+#include <sys/time.h>
 #include <time.h>
-#include <windows.h>
+#include <unistd.h>
 
-#ifdef BACKGROUND_READ
-#error "BACKGROUND_READ not yet implemented for Windows. Please disable."
-// If you need background reading, we'll need to convert pthreads to Windows
-// threads
-#endif
-
-// Windows replacements for Unix functions
-#define usleep(x) Sleep((x) / 1000)
-#define sleep(x) Sleep((x) * 1000)
-
-// Simple gettimeofday implementation for Windows
-int gettimeofday(struct timeval *tv, void *tz) {
-  FILETIME ft;
-  unsigned __int64 tmpres = 0;
-  static int tzflag;
-
-  if (NULL != tv) {
-    GetSystemTimeAsFileTime(&ft);
-
-    tmpres |= ft.dwHighDateTime;
-    tmpres <<= 32;
-    tmpres |= ft.dwLowDateTime;
-
-    tmpres -= 11644473600000000ULL; // Convert to Unix epoch
-    tmpres /= 10;                   // Convert to microseconds
-
-    tv->tv_sec = (long)(tmpres / 1000000UL);
-    tv->tv_usec = (long)(tmpres % 1000000UL);
-  }
-  return 0;
-}
-
-// getopt implementation for Windows
-int optind = 1;
-char *optarg = NULL;
-
-int getopt(int argc, char *argv[], const char *optstring) {
-  static int sp = 1;
-  int opt;
-  char *oloc;
-
-  if (sp == 1) {
-    if (optind >= argc || argv[optind][0] != '-' || argv[optind][1] == '\0')
-      return -1;
-    else if (strcmp(argv[optind], "--") == 0) {
-      optind++;
-      return -1;
-    }
-  }
-
-  opt = argv[optind][sp];
-  oloc = strchr(optstring, opt);
-
-  if (opt == ':' || oloc == NULL) {
-    if (argv[optind][++sp] == '\0') {
-      optind++;
-      sp = 1;
-    }
-    return '?';
-  }
-
-  if (oloc[1] == ':') {
-    if (argv[optind][sp + 1] != '\0')
-      optarg = &argv[optind++][sp + 1];
-    else if (++optind >= argc) {
-      sp = 1;
-      return '?';
-    } else
-      optarg = argv[optind++];
-    sp = 1;
-  } else {
-    if (argv[optind][++sp] == '\0') {
-      sp = 1;
-      optind++;
-    }
-    optarg = NULL;
-  }
-
-  return opt;
-}
-
-/* FTDI Specifics */
 char jtag_port_name[256] = "FTDI SPARTAN6 B";
 int jtag_port_pos = -1;
 
@@ -155,7 +55,7 @@ struct buffer_s {
 
 struct udata_s {
   FILE *f;
-  FT_HANDLE ftdic;
+  struct ftdi_context *ftdic;
   int buffer_size;
   struct buffer_s buffer[BUFFER_SIZE];
   struct read_job_s *job_fifo_out, *job_fifo_in;
@@ -173,7 +73,7 @@ struct udata_s {
   int ftdibuf_len;
   unsigned char ftdibuf[4096];
 #endif
-  __int64 filesize;
+  int64_t filesize;
   int progress;
   unsigned PID;
   unsigned VID;
@@ -192,20 +92,16 @@ static void write_dumpfile(int wr, unsigned char *buf, int size,
   fprintf(dumpfile, "\n");
 }
 
-static int my_ftdi_read_data(FT_HANDLE ftdi, unsigned char *buf, int size,
-                             unsigned int command_id) {
+static int my_ftdi_read_data(struct ftdi_context *ftdi, unsigned char *buf,
+                             int size, unsigned int command_id) {
   int pos = 0;
-  DWORD r;
   int poll_count = 0;
   while (pos < size) {
-    r = 0;
-    int rc = FT_Read(ftdi, buf + pos, size - pos, &r);
-    if (rc != FT_OK) {
-      fprintf(stderr, "[***] ftdi_read_data returned error (rc=%d, r=%d).\n",
-              rc, r);
+    int r = ftdi_read_data(ftdi, buf + pos, size - pos);
+    if (r < 0) {
+      fprintf(stderr, "[***] ftdi_read_data returned error (rc=%d).\n", r);
       break;
     }
-    // this check should only be needed for very low JTAG clock frequencies
     if (r == 0) {
       if (++poll_count > 8) {
         fprintf(stderr,
@@ -214,11 +110,10 @@ static int my_ftdi_read_data(FT_HANDLE ftdi, unsigned char *buf, int size,
                 command_id, pos, size);
         break;
       }
-      // fprintf(stderr, "[%d/8] my_ftdi_read_data with len=%d polling at
-      // %d..\n", poll_count, size, pos);
       usleep(4096 << poll_count);
+    } else {
+      pos += r;
     }
-    pos += r;
   }
   write_dumpfile(0, buf, pos, command_id);
   return pos;
@@ -227,17 +122,15 @@ static int my_ftdi_read_data(FT_HANDLE ftdi, unsigned char *buf, int size,
 static int my_ftdi_write_data(struct udata_s *u, unsigned char *buf, int size,
                               int sync) {
 #ifdef BLOCK_WRITE
-  int rc, total_queued = 0;
-  DWORD w;
-
+  int total_queued = 0;
   sync = 1;
 
   while (size > 0) {
     if (u->ftdibuf_len == 4096) {
       if (dumpfile)
         fprintf(dumpfile, "WRITE %d BYTES (buffer full)\n", u->ftdibuf_len);
-      rc = FT_Write(u->ftdic, u->ftdibuf, u->ftdibuf_len, &w);
-      if (rc != FT_OK || w != u->ftdibuf_len)
+      int w = ftdi_write_data(u->ftdic, u->ftdibuf, u->ftdibuf_len);
+      if (w != u->ftdibuf_len)
         return -1;
       u->ftdibuf_len = 0;
     }
@@ -256,18 +149,16 @@ static int my_ftdi_write_data(struct udata_s *u, unsigned char *buf, int size,
   if (sync && u->ftdibuf_len > 0) {
     if (dumpfile)
       fprintf(dumpfile, "WRITE %d BYTES (sync)\n", u->ftdibuf_len);
-    rc = FT_Write(u->ftdic, u->ftdibuf, u->ftdibuf_len, &w);
-    if (rc != FT_OK || w != u->ftdibuf_len)
+    int w = ftdi_write_data(u->ftdic, u->ftdibuf, u->ftdibuf_len);
+    if (w != u->ftdibuf_len)
       return -1;
     u->ftdibuf_len = 0;
   }
 
   return total_queued;
 #else
-  DWORD w;
-  if (FT_Write(u->ftdic, buf, size, &w) == FT_OK)
-    return w;
-  return -1;
+  int w = ftdi_write_data(u->ftdic, buf, size);
+  return w;
 #endif
 }
 
@@ -297,196 +188,148 @@ static void transfer_tms_job_handler(struct udata_s *u, struct read_job_s *job,
                                      unsigned char *data) {
   int i;
   for (i = 0; i < job->bits_len; i++) {
-    // seams like output is align to the MSB in the byte and is LSB first
-    int bitpos = i + (8 - job->bits_len);
-    int line_tdo = (*data & (1 << bitpos)) != 0 ? 1 : 0;
-    if (job->buffer[i].tdo_enable && job->buffer[i].tdo != line_tdo)
-      u->error_rc = -1;
-    if (job->buffer[i].rmask && u->retval_i < 256)
-      u->retval[u->retval_i++] = line_tdo;
-    u->last_tdo = line_tdo;
-  }
-}
-
-static void transfer_tms(struct udata_s *u, struct buffer_s *d, int tdi,
-                         int len) {
-  int i, rc;
-
-  unsigned char data_command[] = {0x6e, len - 1, tdi << 7, 0x87};
-
-  for (i = 0; i < len; i++)
-    data_command[2] |= d[i].tms << i;
-  data_command[2] |= d[len - 1].tms << len;
-  u->last_tms = d[len - 1].tms;
-
-  struct read_job_s *rj = new_read_job(u, 1, len, d, &transfer_tms_job_handler);
-
-  write_dumpfile(1, data_command, sizeof(data_command), rj->command_id);
-  rc = my_ftdi_write_data(u, data_command, sizeof(data_command), 0);
-  if (rc != sizeof(data_command)) {
-    fprintf(stderr, "IO Error: Transfer tms write failed: (rc=%d/%d)\n", rc,
-            (int)sizeof(data_command));
-    u->error_rc = -1;
+    int bit = (data[i / 8] & (1 << (i % 8))) != 0;
+    if (job->buffer[i].rmask) {
+      if (u->retval_i < 256)
+        u->retval[u->retval_i++] = bit;
+    }
+    if (job->buffer[i].tdo_enable && bit != job->buffer[i].tdo) {
+      if (u->verbose >= 1)
+        printf("[***] TDO mismatch: read %d, expected %d at bit %d in command "
+               "%d.\n",
+               bit, job->buffer[i].tdo, i, job->command_id);
+      if (!u->forcemode)
+        u->error_rc = -1;
+    }
+    u->last_tdo = bit;
   }
 }
 
 static void transfer_tdi_job_handler(struct udata_s *u, struct read_job_s *job,
                                      unsigned char *data) {
-  int i, j, k;
-  int bytes = job->bits_len / 8;
-  int bits = job->bits_len % 8;
-
-  for (i = 0, j = 0; j < bytes; j++) {
-    for (k = 0; k < 8; k++, i++) {
-      int line_tdo = (data[j] & (1 << k)) != 0 ? 1 : 0;
-      if (job->buffer[i].tdo_enable && job->buffer[i].tdo != line_tdo)
-        if (!u->forcemode)
-          u->error_rc = -1;
-      if (job->buffer[j * 8 + k].rmask && u->retval_i < 256)
-        u->retval[u->retval_i++] = line_tdo;
+  int i;
+  for (i = 0; i < job->bits_len; i++) {
+    int bit = (data[i / 8] & (1 << (i % 8))) != 0;
+    if (job->buffer[i].rmask) {
+      if (u->retval_i < 256)
+        u->retval[u->retval_i++] = bit;
     }
-  }
-  for (j = 0; j < bits; j++, i++) {
-    int bitpos = j + (8 - bits);
-    int line_tdo = (data[bytes] & (1 << bitpos)) != 0 ? 1 : 0;
-    if (job->buffer[i].tdo_enable && job->buffer[i].tdo != line_tdo)
+    if (job->buffer[i].tdo_enable && bit != job->buffer[i].tdo) {
+      if (u->verbose >= 1)
+        printf("[***] TDO mismatch: read %d, expected %d at bit %d in command "
+               "%d.\n",
+               bit, job->buffer[i].tdo, i, job->command_id);
       if (!u->forcemode)
         u->error_rc = -1;
-    if (job->buffer[i].rmask && u->retval_i < 256)
-      u->retval[u->retval_i++] = line_tdo;
-    u->last_tdo = line_tdo;
-  }
-}
-
-static void transfer_tdi(struct udata_s *u, struct buffer_s *d, int len) {
-  int bytes = len / 8;
-  int bits = len % 8;
-
-  int command_len = 1;
-  int data_len = 0;
-  if (bytes) {
-    command_len += 3 + bytes;
-    data_len += bytes;
-  }
-  if (bits) {
-    command_len += 3;
-    data_len++;
-  }
-
-  int i, j, k, rc;
-  unsigned char *command = malloc(command_len);
-
-  i = 0;
-  if (bytes) {
-    command[i++] = 0x39;
-    command[i++] = (bytes - 1) & 0xff;
-    command[i++] = (bytes - 1) >> 8;
-    for (j = 0; j < bytes; j++, i++) {
-      command[i] = 0;
-      for (k = 0; k < 8; k++)
-        command[i] |= d[j * 8 + k].tdi << k;
     }
+    u->last_tdo = bit;
   }
-  if (bits) {
-    command[i++] = 0x3b;
-    command[i++] = bits - 1;
-    command[i] = 0;
-    for (j = 0; j < bits; j++)
-      command[i] |= d[bytes * 8 + j].tdi << j;
-    i++;
-  }
-  command[i] = 0x87;
-  assert(i + 1 == command_len);
-
-  struct read_job_s *rj =
-      new_read_job(u, data_len, len, d, &transfer_tdi_job_handler);
-
-  write_dumpfile(1, command, command_len, rj->command_id);
-  rc = my_ftdi_write_data(u, command, command_len, 0);
-  if (rc != command_len) {
-    fprintf(stderr, "IO Error: Transfer tdi write failed: (rc=%d/%d)\n", rc,
-            command_len);
-    u->error_rc = -1;
-  }
-
-  free(command);
-}
-
-static void process_next_read_job(struct udata_s *u) {
-  if (!u->job_fifo_out)
-    return;
-
-  struct read_job_s *job = u->job_fifo_out;
-
-  u->job_fifo_out = job->next;
-  if (!u->job_fifo_out)
-    u->job_fifo_in = NULL;
-
-  unsigned char *data = malloc(job->data_len);
-  if (my_ftdi_read_data(u->ftdic, data, job->data_len, job->command_id) !=
-      job->data_len) {
-    fprintf(stderr, "IO Error: FTDI/USB read failed!\n");
-    u->error_rc = -1;
-  } else {
-    job->handler(u, job, data);
-  }
-
-  free(data);
-  free(job->buffer);
-  free(job);
 }
 
 static void buffer_flush(struct udata_s *u) {
-  if (u->filesize > 0 && u->progress > 0) {
-    long pos = ftell(u->f);
-    printf("\r Progress : [%3d%%] %ld/%lld\r",
-           (int)(((float)pos / (float)u->filesize) * 100), pos, u->filesize);
-    fflush(stdout);
+  int i, j, data_len, bits_len;
+  unsigned char cmd[4096];
+  unsigned char *rxdata;
+  int cmd_i = 0;
+  struct buffer_s *b;
+  struct read_job_s *job;
+
+  for (i = 0; i < u->buffer_i; i = j) {
+    for (j = i; j < u->buffer_i; j++) {
+      if (u->buffer[i].tdi_enable != u->buffer[j].tdi_enable)
+        break;
+      if (u->buffer[i].tdo_enable != u->buffer[j].tdo_enable)
+        break;
+      if (u->buffer[i].rmask != u->buffer[j].rmask)
+        break;
+    }
+
+    b = u->buffer + i;
+    bits_len = j - i;
+    data_len = (bits_len + 7) / 8;
+
+    if (b->tdi_enable) {
+      cmd[cmd_i++] = (b->tdo_enable || b->rmask) ? 0x3b : 0x1b;
+      cmd[cmd_i++] = bits_len - 1;
+      cmd[cmd_i] = 0;
+
+      for (j = 0; j < bits_len; j++) {
+        if (u->buffer[i + j].tdi)
+          cmd[cmd_i] |= 1 << (j % 8);
+        if (j % 8 == 7 || j == bits_len - 1)
+          cmd_i++;
+      }
+
+      if (b->tdo_enable || b->rmask)
+        new_read_job(u, data_len, bits_len, u->buffer + i,
+                     transfer_tdi_job_handler);
+    } else {
+      cmd[cmd_i++] = (b->tdo_enable || b->rmask) ? 0x6e : 0x4b;
+      cmd[cmd_i++] = bits_len - 1;
+      cmd[cmd_i] = 0;
+
+      for (j = 0; j < bits_len; j++) {
+        if (u->buffer[i + j].tms)
+          cmd[cmd_i] |= 1 << (j % 8);
+        if (j % 8 == 7 || j == bits_len - 1)
+          cmd_i++;
+      }
+
+      if (b->tdo_enable || b->rmask)
+        new_read_job(u, data_len, bits_len, u->buffer + i,
+                     transfer_tms_job_handler);
+    }
+
+    u->last_tms = u->buffer[j - 1].tms;
   }
 
-  int pos = 0;
-  while (pos < u->buffer_i) {
-    struct buffer_s b = u->buffer[pos];
-    if (u->last_tms != b.tms) {
-      int len = u->buffer_i - pos;
-      len = len > 6 ? 6 : len;
-      int tdi = -1, i;
-      for (i = 0; i < len; i++) {
-        if (!u->buffer[pos + i].tdi_enable)
-          continue;
-        if (tdi < 0)
-          tdi = u->buffer[pos + i].tdi;
-        if (tdi != u->buffer[pos + i].tdi)
-          len = i;
-      }
-      transfer_tms(u, u->buffer + pos, (tdi & 1), len);
-      pos += len;
-      continue;
-    }
-    int len = u->buffer_i - pos;
-    int i;
-    for (i = 0; i < len; i++) {
-      if (u->buffer[pos + i].tms != u->last_tms)
-        len = i;
-    }
-    transfer_tdi(u, u->buffer + pos, len);
-    pos += len;
-  }
   u->buffer_i = 0;
 
-#ifdef BLOCK_WRITE
-  int rc = my_ftdi_write_data(u, NULL, 0, 1);
-  if (rc != 0) {
-    fprintf(stderr, "IO Error: Ftdi write failed\n");
+  write_dumpfile(1, cmd, cmd_i, 0);
+  if (my_ftdi_write_data(u, cmd, cmd_i, 0) != cmd_i) {
+    fprintf(stderr, "IO Error: Short write in buffer_flush.\n");
     u->error_rc = -1;
   }
-#endif
 
-  while (u->job_fifo_out)
-    process_next_read_job(u);
+  if (u->progress && u->filesize > 0) {
+    long long pos = ftell(u->f);
+    int prog = (int)((pos * 100) / u->filesize);
+    if (prog != u->progress) {
+      u->progress = prog;
+      fprintf(stderr, "\rProgress: [%3d%%]", u->progress);
+      fflush(stderr);
+    }
+  }
 }
 
-static void buffer_sync(struct udata_s *u) { buffer_flush(u); }
+static void buffer_sync(struct udata_s *u) {
+  buffer_flush(u);
+
+  if (!u->job_fifo_out)
+    return;
+
+  my_ftdi_write_data(u, NULL, 0, 1);
+
+  while (u->job_fifo_out) {
+    struct read_job_s *job = u->job_fifo_out;
+    u->job_fifo_out = job->next;
+    if (!u->job_fifo_out)
+      u->job_fifo_in = NULL;
+
+    unsigned char *rxdata = malloc(job->data_len);
+    if (my_ftdi_read_data(u->ftdic, rxdata, job->data_len, job->command_id) !=
+        job->data_len) {
+      fprintf(stderr, "IO Error: Short read in buffer_sync.\n");
+      u->error_rc = -1;
+    } else {
+      job->handler(u, job, rxdata);
+    }
+
+    free(rxdata);
+    free(job->buffer);
+    free(job);
+  }
+}
 
 static void buffer_add(struct udata_s *u, int tms, int tdi, int tdo,
                        int rmask) {
@@ -504,69 +347,95 @@ static void buffer_add(struct udata_s *u, int tms, int tdi, int tdo,
 
 #define MAX_DEVICES 32
 
-void listFTDI() {
-  FT_STATUS ftStatus;
-  int iNumDevs = 0, i;
-  char *pcBufLD[MAX_DEVICES + 1];
-  char cBufLD[MAX_DEVICES][64];
+void listFTDI(void) {
+  struct ftdi_context *ftdi = ftdi_new();
+  if (!ftdi)
+    return;
 
-  for (i = 0; i < MAX_DEVICES; i++) {
-    pcBufLD[i] = cBufLD[i];
+  struct ftdi_device_list *devlist = NULL;
+  int count = ftdi_usb_find_all(ftdi, &devlist, 0x0403, 0);
+  if (count < 0) {
+    fprintf(stderr, "Error finding FTDI devices: %s\n",
+            ftdi_get_error_string(ftdi));
+    ftdi_free(ftdi);
+    return;
   }
-  pcBufLD[MAX_DEVICES] = NULL;
 
-  ftStatus =
-      FT_ListDevices(pcBufLD, &iNumDevs, FT_LIST_ALL | FT_OPEN_BY_DESCRIPTION);
-
-  if (ftStatus != FT_OK) {
-    printf("Error: FT_ListDevices(%d)\n", ftStatus);
-    exit(1);
+  printf("%d devices found\n", count);
+  struct ftdi_device_list *curdev = devlist;
+  int i = 0;
+  while (curdev) {
+    char manufacturer[128] = {0};
+    char description[128] = {0};
+    char serial[128] = {0};
+    ftdi_usb_get_strings2(ftdi, curdev->dev, manufacturer, 128, description,
+                          128, serial, 128);
+    printf("Device %d - Description: '%s', Serial: '%s'\n", i++, description,
+           serial);
+    curdev = curdev->next;
   }
-  printf("%d devices\n", iNumDevs);
 
-  for (i = 0; ((i < MAX_DEVICES) && (i < iNumDevs)); i++) {
-    printf("Device %d - '%s'\n", i, cBufLD[i]);
-  }
+  ftdi_list_free(&devlist);
+  ftdi_free(ftdi);
 }
 
 static int h_setup(struct libxsvf_host *h) {
-  DWORD w;
-  FT_STATUS ret;
-
   struct udata_s *u = h->user_data;
   u->buffer_size = BUFFER_SIZE;
 #ifdef BLOCK_WRITE
   u->ftdibuf_len = 0;
 #endif
 
-  if (jtag_port_pos >= 0)
-    ret = FT_Open(jtag_port_pos, &u->ftdic);
-  else
-    ret = FT_OpenEx(jtag_port_name, FT_OPEN_BY_DESCRIPTION, &u->ftdic);
-
-  if (ret != FT_OK) {
-    fprintf(stderr, "Failed to Open FTDI JTAG Interface(%s or %d) ret %d\n",
-            jtag_port_name, jtag_port_pos, ret);
+  u->ftdic = ftdi_new();
+  if (!u->ftdic) {
+    fprintf(stderr, "Failed to allocate libftdi context\n");
     return -1;
   }
 
-  if (FT_ResetDevice(u->ftdic) != FT_OK ||
-      FT_SetBitMode(u->ftdic, 0x00, 0) != FT_OK ||
-      FT_SetLatencyTimer(u->ftdic, 2) != FT_OK ||
-      FT_SetTimeouts(u->ftdic, 5000, 5000) != FT_OK ||
-      FT_SetBitMode(u->ftdic, 0x0B, 2) != FT_OK)
-    return -1;
+  enum ftdi_interface interface = INTERFACE_A;
+  if (strstr(jtag_port_name, " B") || strstr(jtag_port_name, " Channel B")) {
+    interface = INTERFACE_B;
+  }
+  ftdi_set_interface(u->ftdic, interface);
+  u->ftdic->module_detach_mode = AUTO_DETACH_SIO_MODULE;
 
-  unsigned char amontec_init_commands[] = {
-      0x8B, 0x97, 0x8D, // 12Mhz internal clk, no adaptative clocking
+  int vid = u->VID ? u->VID : 0x0403;
+  int pid = u->PID ? u->PID : 0x6010;
+  int ret = ftdi_usb_open(u->ftdic, vid, pid);
+  if (ret < 0) {
+    // Fallback to 0x6011 (FT4232H) or 0x6001 (FT232R)
+    if (ftdi_usb_open(u->ftdic, vid, 0x6011) < 0 &&
+        ftdi_usb_open(u->ftdic, vid, 0x6001) < 0) {
+      fprintf(stderr, "Failed to Open FTDI JTAG Interface (%s): %s (%d)\n",
+              jtag_port_name, ftdi_get_error_string(u->ftdic), ret);
+      ftdi_free(u->ftdic);
+      u->ftdic = NULL;
+      return -1;
+    }
+  }
+
+  if (ftdi_usb_reset(u->ftdic) < 0 ||
+      ftdi_set_bitmode(u->ftdic, 0x00, BITMODE_RESET) < 0 ||
+      ftdi_set_latency_timer(u->ftdic, 2) < 0 ||
+      ftdi_set_bitmode(u->ftdic, 0x0B, BITMODE_MPSSE) < 0) {
+    fprintf(stderr, "Failed to configure FTDI MPSSE bitmode: %s\n",
+            ftdi_get_error_string(u->ftdic));
+    ftdi_usb_close(u->ftdic);
+    ftdi_free(u->ftdic);
+    u->ftdic = NULL;
+    return -1;
+  }
+
+  unsigned char init_commands[] = {
+      0x8B, 0x97, 0x8D, // 12Mhz internal clk
       0x86, 0x02, 0x00, // initial clk freq (2 MHz)
       0x80, 0x08, 0x1b, // initial line states
       0x85,             // disable loopback
   };
 
-  write_dumpfile(1, amontec_init_commands, sizeof(amontec_init_commands), 0);
-  if (FT_Write(u->ftdic, amontec_init_commands, sizeof(amontec_init_commands),
-               &w) != FT_OK) {
+  write_dumpfile(1, init_commands, sizeof(init_commands), 0);
+  if (ftdi_write_data(u->ftdic, init_commands, sizeof(init_commands)) !=
+      sizeof(init_commands)) {
     fprintf(stderr, "IO Error: Interface setup failed (init commands)\n");
     return -1;
   }
@@ -587,6 +456,12 @@ static int h_setup(struct libxsvf_host *h) {
 static int h_shutdown(struct libxsvf_host *h) {
   struct udata_s *u = h->user_data;
   buffer_sync(u);
+  if (u->ftdic) {
+    ftdi_set_bitmode(u->ftdic, 0x00, BITMODE_RESET);
+    ftdi_usb_close(u->ftdic);
+    ftdi_free(u->ftdic);
+    u->ftdic = NULL;
+  }
   return u->error_rc;
 }
 
@@ -726,21 +601,11 @@ static struct libxsvf_host h = {.udelay = h_udelay,
 
 const char *progname;
 
-static void help() {
+static void help(void) {
   fprintf(stderr, "\n");
-  fprintf(stderr, "A JTAG SVF/XSVF Player based on libxsvf for the FTDI "
-                  "FT232H, FT2232H and\n");
-  fprintf(stderr, "FT4232H High Speed USB to Multipurpose UART/FIFO ICs.\n");
-  fprintf(stderr, "\n");
-  fprintf(stderr, "xsvftool-ft2232h, part of Lib(X)SVF "
-                  "(http://www.clifford.at/libxsvf/).\n");
-  fprintf(stderr, "Copyright (C) 2009  RIEGL Research ForschungsGmbH\n");
-  fprintf(stderr, "Copyright (C) 2009  Clifford Wolf <clifford@clifford.at>\n");
-  fprintf(stderr, "Ported to Windows by Pheeeeenom (Mena). For use with "
-                  "J-Runner with Extras!\n");
-  fprintf(stderr,
-          "Lib(X)SVF is free software licensed under the ISC license.\n");
-  fprintf(stderr, "\n");
+  fprintf(stderr, "A JTAG SVF/XSVF Player based on libxsvf for FTDI FT232H, "
+                  "FT2232H, FT4232H\n");
+  fprintf(stderr, "libftdi1 Port\n\n");
   fprintf(stderr,
           "Usage: %s [ -v[v..] ] [ -d dumpfile ] [ -p ] [ -L | -B ] [ -S ] [ "
           "-F ] \\\n",
@@ -750,57 +615,24 @@ static void help() {
       "      %*s [ -f freq[k|M] ] { -s svf-file | -x xsvf-file | -c } ...\n",
       (int)(strlen(progname) + 1), "");
   fprintf(stderr, "\n");
-  fprintf(stderr, "   -p\n");
-  fprintf(stderr, "          Show progress\n");
-  fprintf(stderr, "\n");
-  fprintf(stderr, "   -v\n");
-  fprintf(stderr,
-          "          Enable verbose output (repeat for incrased verbosity)\n");
-  fprintf(stderr, "\n");
-  fprintf(stderr, "   -P PID\n");
-  fprintf(stderr, "          PID value for USB FTDI device\n");
-  fprintf(stderr, "\n");
-  fprintf(stderr, "   -U VID\n");
-  fprintf(stderr, "          VID value for USB FTDI device\n");
-  fprintf(stderr, "\n");
-  fprintf(stderr, "   -J jtagport\n");
-  fprintf(stderr, "          JTAG Port Name, by default '%s'\n",
+  fprintf(stderr, "   -p\n          Show progress\n\n");
+  fprintf(stderr, "   -v\n          Enable verbose output\n\n");
+  fprintf(stderr, "   -P PID\n        PID value for USB FTDI device\n\n");
+  fprintf(stderr, "   -U VID\n        VID value for USB FTDI device\n\n");
+  fprintf(stderr, "   -J jtagport\n   JTAG Port Name, by default '%s'\n\n",
           jtag_port_name);
-  fprintf(stderr, "\n");
-  fprintf(stderr, "   -j jtagportnum\n");
-  fprintf(
-      stderr,
-      "          JTAG Port position in -l list, overrides '-J' parameter\n");
-  fprintf(stderr, "\n");
-  fprintf(stderr, "   -l\n");
-  fprintf(stderr, "       List FTDI device names\n");
-  fprintf(stderr, "\n");
-  fprintf(stderr, "   -d dumpfile\n");
-  fprintf(stderr, "          Write a logfile of all MPSSE comunication\n");
-  fprintf(stderr, "\n");
-  fprintf(stderr, "   -L, -B\n");
+  fprintf(stderr, "   -l\n          List FTDI devices\n\n");
   fprintf(stderr,
-          "          Print RMASK bits as hex value (little or big endian)\n");
-  fprintf(stderr, "\n");
-  fprintf(stderr, "   -S\n");
-  fprintf(stderr, "          Run in synchronous mode (slow but report errors "
-                  "right away)\n");
-  fprintf(stderr, "\n");
-  fprintf(stderr, "   -F\n");
-  fprintf(stderr, "          Force mode (ignore all TDO mismatches)\n");
-  fprintf(stderr, "\n");
-  fprintf(stderr, "   -f freq[k|M]\n");
-  fprintf(stderr, "          Set maximum frequency in Hz, kHz or MHz\n");
-  fprintf(stderr, "\n");
-  fprintf(stderr, "   -s svf-file\n");
-  fprintf(stderr, "          Play the specified SVF file\n");
-  fprintf(stderr, "\n");
-  fprintf(stderr, "   -x xsvf-file\n");
-  fprintf(stderr, "          Play the specified XSVF file\n");
-  fprintf(stderr, "\n");
-  fprintf(stderr, "   -c\n");
-  fprintf(stderr, "          List devices in JTAG chain\n");
-  fprintf(stderr, "\n");
+          "   -d dumpfile\n Write a logfile of all MPSSE communication\n\n");
+  fprintf(stderr, "   -L, -B\n      Print RMASK bits as hex value (little or "
+                  "big endian)\n\n");
+  fprintf(stderr, "   -S\n          Run in synchronous mode\n\n");
+  fprintf(stderr,
+          "   -F\n          Force mode (ignore all TDO mismatches)\n\n");
+  fprintf(stderr, "   -f freq[k|M]\n Set maximum frequency\n\n");
+  fprintf(stderr, "   -s svf-file\n  Play the specified SVF file\n\n");
+  fprintf(stderr, "   -x xsvf-file\n Play the specified XSVF file\n\n");
+  fprintf(stderr, "   -c\n          List devices in JTAG chain\n\n");
   exit(1);
 }
 
@@ -810,10 +642,6 @@ int main(int argc, char **argv) {
   int hex_mode = 0;
   int opt, i, j;
   time_t start = time(NULL);
-
-  // Set binary mode for stdin on Windows
-  _setmode(_fileno(stdin), _O_BINARY);
-  _setmode(_fileno(stdout), _O_BINARY);
 
   progname = argc >= 1 ? argv[0] : "xsvftool-play";
   while ((opt = getopt(argc, argv, "pvlP:U:J:j:d:LBSFf:x:s:c")) != -1) {
@@ -879,9 +707,9 @@ int main(int argc, char **argv) {
         break;
       }
       {
-        struct _stat64 _s;
+        struct stat _s;
         u.filesize = 0;
-        if (_stat64(optarg, &_s) < 0)
+        if (stat(optarg, &_s) < 0)
           fprintf(stderr, "Failed to stat file\n");
         else
           u.filesize = _s.st_size;

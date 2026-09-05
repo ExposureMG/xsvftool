@@ -34,8 +34,8 @@ int xsvftool_run(int argc, char **argv);
 /*
  * High-level helper functions for playing SVF/XSVF files or scanning JTAG chain.
  *
- * backend: "FTDI" (or NULL for default FTDI) or "DirtyJTAG" / "D"
- * frequency_hz: Clock frequency in Hz (e.g. 1000000 for 1MHz, 0 for default)
+ * backend: "FTDI" / "A" / NULL  → FTDI backend (FTD2XX on Windows, libftdi elsewhere)
+ *          "DirtyJTAG" / "D"    → DirtyJTAG USB probe (VID=0x1209 PID=0xC0CA)
  */
 int xsvftool_play_xsvf(const char *filename, const char *backend, int frequency_hz);
 int xsvftool_play_svf(const char *filename, const char *backend, int frequency_hz);

@@ -32,15 +32,25 @@
 #define COMBINED_BUILD
 #endif
 
+#include <stdint.h>
+#ifndef _WIN32
+typedef int64_t __int64;
+#endif
+
+#include "xsvftool.h"
+#ifdef _WIN32
 #include "xsvfplay_ftd2xx.c"
+#else
+#include "xsvfplay_libftdi.c"
+#endif
 #include "xsvfplay_dirtyjtag.c"
 
-/* ---- Unified getopt (Windows) ------------------------------------------- */
-/* xsvfplay_ftd2xx.c already defines getopt / optind / optarg when _WIN32 is
- * set, and those definitions are now visible here via the #include above.    */
+/* ---- getopt ---------------------------------------------------------------- */
+/* On Windows, getopt/optind/optarg are defined in xsvfplay_ftd2xx.c (above). */
+/* On other platforms the system provides getopt via <unistd.h>.              */
 
 /* ---- Help ---------------------------------------------------------------- */
-static void combined_help(const char *progname)
+static int combined_help(const char *progname)
 {
     fprintf(stderr, "\n");
     fprintf(stderr, "A JTAG SVF/XSVF Player supporting FTDI and DirtyJTAG probes.\n");
@@ -49,7 +59,11 @@ static void combined_help(const char *progname)
     fprintf(stderr, "Usage: %s [backend] [options] { -s svf | -x xsvf | -c | -l } ...\n", progname);
     fprintf(stderr, "\n");
     fprintf(stderr, "Backend (default: FTDI):\n");
-    fprintf(stderr, "   -A          FTDI FT232H / FT2232H / FT4232H (default)\n");
+#ifdef _WIN32
+    fprintf(stderr, "   -A          FTDI FT232H / FT2232H / FT4232H (FTD2XX, default)\n");
+#else
+    fprintf(stderr, "   -A          FTDI FT232H / FT2232H / FT4232H (libftdi, default)\n");
+#endif
     fprintf(stderr, "   -D          DirtyJTAG USB probe (VID=0x1209 PID=0xC0CA)\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "FTDI-only options:\n");
@@ -71,11 +85,11 @@ static void combined_help(const char *progname)
     fprintf(stderr, "   -S          Synchronous mode\n");
     fprintf(stderr, "   -F          Force mode (ignore TDO mismatches)\n");
     fprintf(stderr, "\n");
-    exit(1);
+    return 1;
 }
 
-/* ---- main --------------------------------------------------------------- */
-int main(int argc, char **argv)
+/* ---- Library & Entry Point ----------------------------------------------- */
+int xsvftool_run(int argc, char **argv)
 {
     int rc            = 0;
     int gotaction     = 0;
@@ -85,6 +99,15 @@ int main(int argc, char **argv)
     const char *progname = argc >= 1 ? argv[0] : "xsvftool";
 
     time_t start = time(NULL);
+
+    /* Reset global state for re-entrancy */
+    optind = 1;
+    optarg = NULL;
+    memset(&u, 0, sizeof(u));
+    memset(&dj_u, 0, sizeof(dj_u));
+    strncpy(jtag_port_name, "FTDI SPARTAN6 B", sizeof(jtag_port_name) - 1);
+    jtag_port_pos = -1;
+    dumpfile = NULL;
 
 #ifdef _WIN32
     _setmode(_fileno(stdin),  _O_BINARY);
@@ -133,7 +156,7 @@ int main(int argc, char **argv)
                 if      (*optarg == 'k') { freq *= 1000;    optarg++; }
                 else if (*optarg == 'M') { freq *= 1000000; optarg++; }
                 else if (optarg[0]=='H' && optarg[1]=='z') { optarg += 2; }
-                else combined_help(progname);
+                else return combined_help(progname);
             }
             if (use_dirtyjtag) dj_u.frequency = freq; else u.frequency = freq;
             break;
@@ -188,8 +211,13 @@ int main(int argc, char **argv)
                 rc = 1; break;
             }
             {
+#ifdef _WIN32
                 struct _stat64 st; *fsz = 0;
                 if (_stat64(optarg, &st) == 0) *fsz = st.st_size;
+#else
+                struct stat st; *fsz = 0;
+                if (stat(optarg, &st) == 0) *fsz = st.st_size;
+#endif
             }
             {
                 struct libxsvf_host *be = use_dirtyjtag ? &dj_h : &h;
@@ -220,12 +248,12 @@ int main(int argc, char **argv)
         }
 
         default:
-            combined_help(progname);
+            return combined_help(progname);
         }
     }
 
     if (!gotaction)
-        combined_help(progname);
+        return combined_help(progname);
 
     {
         int  rv_i = use_dirtyjtag ? dj_u.retval_i : u.retval_i;
@@ -251,3 +279,73 @@ int main(int argc, char **argv)
     printf("\n\nTime : %ld\n", (long)(time(NULL) - start));
     return rc;
 }
+
+int xsvftool_play_xsvf(const char *filename, const char *backend, int frequency_hz)
+{
+    char freq_str[32];
+    int is_dj = (backend && (strcmp(backend, "DirtyJTAG") == 0 || strcmp(backend, "-D") == 0 || strcmp(backend, "D") == 0));
+    const char *argv[8];
+    int argc = 0;
+
+    argv[argc++] = "xsvftool";
+    argv[argc++] = is_dj ? "-D" : "-A";
+    if (frequency_hz > 0) {
+        snprintf(freq_str, sizeof(freq_str), "%d", frequency_hz);
+        argv[argc++] = "-f";
+        argv[argc++] = freq_str;
+    }
+    argv[argc++] = "-x";
+    argv[argc++] = filename;
+    argv[argc] = NULL;
+
+    return xsvftool_run(argc, (char **)argv);
+}
+
+int xsvftool_play_svf(const char *filename, const char *backend, int frequency_hz)
+{
+    char freq_str[32];
+    int is_dj = (backend && (strcmp(backend, "DirtyJTAG") == 0 || strcmp(backend, "-D") == 0 || strcmp(backend, "D") == 0));
+    const char *argv[8];
+    int argc = 0;
+
+    argv[argc++] = "xsvftool";
+    argv[argc++] = is_dj ? "-D" : "-A";
+    if (frequency_hz > 0) {
+        snprintf(freq_str, sizeof(freq_str), "%d", frequency_hz);
+        argv[argc++] = "-f";
+        argv[argc++] = freq_str;
+    }
+    argv[argc++] = "-s";
+    argv[argc++] = filename;
+    argv[argc] = NULL;
+
+    return xsvftool_run(argc, (char **)argv);
+}
+
+int xsvftool_scan_chain(const char *backend, int frequency_hz)
+{
+    char freq_str[32];
+    int is_dj = (backend && (strcmp(backend, "DirtyJTAG") == 0 || strcmp(backend, "-D") == 0 || strcmp(backend, "D") == 0));
+    const char *argv[8];
+    int argc = 0;
+
+    argv[argc++] = "xsvftool";
+    argv[argc++] = is_dj ? "-D" : "-A";
+    if (frequency_hz > 0) {
+        snprintf(freq_str, sizeof(freq_str), "%d", frequency_hz);
+        argv[argc++] = "-f";
+        argv[argc++] = freq_str;
+    }
+    argv[argc++] = "-c";
+    argv[argc] = NULL;
+
+    return xsvftool_run(argc, (char **)argv);
+}
+
+#ifndef XSVFTOOL_NO_MAIN
+int main(int argc, char **argv)
+{
+    return xsvftool_run(argc, argv);
+}
+#endif
+
